@@ -2,13 +2,17 @@ package runner
 
 import (
 	"context"
+	"io"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
 
+	"github.com/nektos/act/pkg/container"
 	"github.com/nektos/act/pkg/model"
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
 func TestNewRemoteActionRejectsEscapingPaths(t *testing.T) {
@@ -99,6 +103,160 @@ func TestLocalRepositoryCacheRejectsEscapingPrefix(t *testing.T) {
 	r, err := c.GetTarArchive(ctx, "org/repo", "sha", "action.yml")
 	assert.NoError(t, err)
 	r.Close()
+}
+
+func TestLocalTrampolineStaysInWorkspace(t *testing.T) {
+	workdir := t.TempDir()
+	outside := t.TempDir()
+	rel, err := filepath.Rel(workdir, outside)
+	require.NoError(t, err)
+	_, err = resolveLocalActionDir(workdir, "./"+filepath.ToSlash(rel))
+	assert.Error(t, err)
+
+	require.NoError(t, os.Symlink(outside, filepath.Join(workdir, "link")))
+	actionDir, err := resolveLocalActionDir(workdir, "./link")
+	require.NoError(t, err)
+	step := &model.Step{With: map[string]string{"args": "true"}}
+	missing := func(string) (io.Reader, io.Closer, error) {
+		return nil, nil, fs.ErrNotExist
+	}
+	_, err = readActionImpl(context.Background(), step, actionDir, "", missing, rootedWriter(workdir))
+	assert.Error(t, err)
+	_, statErr := os.Stat(filepath.Join(outside, "trampoline.js"))
+	assert.ErrorIs(t, statErr, fs.ErrNotExist)
+
+	action := filepath.Join(workdir, "action")
+	require.NoError(t, os.Mkdir(action, 0o755))
+	actionDir, err = resolveLocalActionDir(workdir, "./action")
+	require.NoError(t, err)
+	_, err = readActionImpl(context.Background(), step, actionDir, "", missing, rootedWriter(workdir))
+	require.NoError(t, err)
+	body, err := os.ReadFile(filepath.Join(action, "trampoline.js"))
+	require.NoError(t, err)
+	assert.Contains(t, string(body), "spawnSync")
+
+	called := false
+	_, err = readActionImpl(context.Background(), step, workdir, "../../tmp", missing, func(string, []byte, fs.FileMode) error {
+		called = true
+		return nil
+	})
+	assert.Error(t, err)
+	assert.False(t, called)
+}
+
+func TestResolveDockerContextContained(t *testing.T) {
+	_, _, err := resolveDockerContext("", "../../../../tmp/secret/Dockerfile", false)
+	assert.Error(t, err)
+	_, _, err = resolveDockerContext("/work/action", "../../../../../../tmp/secret/Dockerfile", true)
+	assert.Error(t, err)
+
+	dir, file, err := resolveDockerContext("", "/tmp/secret/Dockerfile", false)
+	require.NoError(t, err)
+	assert.Equal(t, "Dockerfile", file)
+	assert.Equal(t, "tmp/secret/", dir)
+	checkout := t.TempDir()
+	host, err := joinUnder(checkout, strings.TrimSuffix(dir, "/"))
+	require.NoError(t, err)
+	rel, err := filepath.Rel(checkout, host)
+	require.NoError(t, err)
+	assert.True(t, filepath.IsLocal(rel), rel)
+
+	dir, file, err = resolveDockerContext("/work/action", "Dockerfile", true)
+	require.NoError(t, err)
+	assert.Equal(t, "Dockerfile", file)
+	assert.Equal(t, "/work/action", dir)
+}
+
+func TestDockerContextSymlinkStaysInCheckout(t *testing.T) {
+	checkout := t.TempDir()
+	outside := t.TempDir()
+	require.NoError(t, os.Mkdir(filepath.Join(outside, "sub"), 0o755))
+	require.NoError(t, os.WriteFile(filepath.Join(outside, "sub", "SECRET.txt"), []byte("host-secret"), 0o600))
+	require.NoError(t, os.Symlink(outside, filepath.Join(checkout, "escape")))
+
+	// Lexical validation still allows this path. The host context join follows
+	// the symlink and can read the marker. The containment check must refuse.
+	err := validateRemoteActionPaths(&model.Action{Runs: model.ActionRuns{Image: "escape/sub/Dockerfile"}}, "")
+	assert.NoError(t, err)
+	dir, file, err := resolveDockerContext("", "escape/sub/Dockerfile", false)
+	require.NoError(t, err)
+	assert.Equal(t, "Dockerfile", file)
+	assert.Equal(t, "escape/sub/", dir)
+	host, err := joinUnder(checkout, strings.TrimSuffix(dir, "/"))
+	require.NoError(t, err)
+	body, err := os.ReadFile(filepath.Join(host, "SECRET.txt"))
+	require.NoError(t, err)
+	assert.Equal(t, "host-secret", string(body))
+	assert.Error(t, rejectHostContextEscape(checkout, host))
+
+	realDir := filepath.Join(checkout, "real")
+	require.NoError(t, os.Mkdir(realDir, 0o755))
+	require.NoError(t, os.WriteFile(filepath.Join(realDir, "Dockerfile"), []byte("FROM scratch\n"), 0o600))
+	require.NoError(t, os.Symlink("real", filepath.Join(checkout, "link")))
+	assert.NoError(t, rejectHostContextEscape(checkout, filepath.Join(checkout, "link")))
+}
+
+func TestLocalDockerContextRoot(t *testing.T) {
+	outside := t.TempDir()
+	require.NoError(t, os.WriteFile(filepath.Join(outside, "SECRET.txt"), []byte("host-secret"), 0o600))
+
+	t.Run("host executor", func(t *testing.T) {
+		workdir := t.TempDir()
+		copied := t.TempDir()
+		action := filepath.Join(copied, "docker-action-host-env", "action")
+		require.NoError(t, os.MkdirAll(action, 0o755))
+		require.NoError(t, os.WriteFile(filepath.Join(action, "Dockerfile"), []byte("FROM scratch\n"), 0o600))
+		require.NoError(t, os.Symlink(outside, filepath.Join(copied, "escape")))
+
+		rc := &RunContext{
+			Config: &Config{Workdir: workdir},
+			JobContainer: &container.HostEnvironment{
+				Path:    copied,
+				Workdir: workdir,
+			},
+		}
+		root := localActionWorkspace(rc)
+		assert.Equal(t, copied, root)
+
+		// The action lives in the copied workspace, not the original workdir.
+		assert.NoError(t, rejectHostContextEscape(root, action))
+		assert.Error(t, rejectHostContextEscape(workdir, action))
+
+		// A plain read follows the symlink. Containment must still reject it,
+		// and a ../ image path must still fail lexically.
+		body, err := os.ReadFile(filepath.Join(copied, "escape", "SECRET.txt"))
+		require.NoError(t, err)
+		assert.Equal(t, "host-secret", string(body))
+		assert.Error(t, rejectHostContextEscape(root, filepath.Join(copied, "escape")))
+		_, _, err = resolveDockerContext(action, "../../../../../../tmp/secret/Dockerfile", true)
+		assert.Error(t, err)
+		_, err = resolveLocalActionDir(workdir, "./../../..")
+		assert.Error(t, err)
+	})
+
+	t.Run("container executor", func(t *testing.T) {
+		workdir := t.TempDir()
+		action := filepath.Join(workdir, "action")
+		require.NoError(t, os.Mkdir(action, 0o755))
+		require.NoError(t, os.WriteFile(filepath.Join(action, "Dockerfile"), []byte("FROM scratch\n"), 0o600))
+		require.NoError(t, os.Symlink(outside, filepath.Join(workdir, "escape")))
+
+		rc := &RunContext{
+			Config:       &Config{Workdir: workdir},
+			JobContainer: &containerMock{},
+		}
+		root := localActionWorkspace(rc)
+		assert.Equal(t, workdir, root)
+		assert.NoError(t, rejectHostContextEscape(root, action))
+		body, err := os.ReadFile(filepath.Join(workdir, "escape", "SECRET.txt"))
+		require.NoError(t, err)
+		assert.Equal(t, "host-secret", string(body))
+		assert.Error(t, rejectHostContextEscape(root, filepath.Join(workdir, "escape")))
+		_, _, err = resolveDockerContext(action, "../../../../../../tmp/secret/Dockerfile", true)
+		assert.Error(t, err)
+		_, err = resolveLocalActionDir(workdir, "./../../..")
+		assert.Error(t, err)
+	})
 }
 
 func TestRestrictWorkflowContainerOptions(t *testing.T) {
