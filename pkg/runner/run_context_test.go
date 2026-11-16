@@ -3,6 +3,7 @@ package runner
 import (
 	"context"
 	"fmt"
+	"net/http"
 	"os"
 	"regexp"
 	"runtime"
@@ -11,6 +12,8 @@ import (
 	"testing"
 
 	"github.com/golang-jwt/jwt/v5"
+
+	"github.com/nektos/act/pkg/common"
 	"github.com/nektos/act/pkg/exprparser"
 	"github.com/nektos/act/pkg/model"
 
@@ -681,8 +684,9 @@ func TestRunContextGetEnv(t *testing.T) {
 func TestSetRuntimeVariables(t *testing.T) {
 	rc := &RunContext{
 		Config: &Config{
-			ArtifactServerAddr: "myhost",
-			ArtifactServerPort: "8000",
+			ArtifactServerAddr:    "myhost",
+			ArtifactServerPort:    "8000",
+			ArtifactServerAuthKey: []byte("artifact server auth key"),
 		},
 	}
 	v := "http://myhost:8000/"
@@ -697,13 +701,21 @@ func TestSetRuntimeVariables(t *testing.T) {
 	tkn, _, err := jwt.NewParser().ParseUnverified(runtimeToken, jwt.MapClaims{})
 	assert.NotNil(t, tkn)
 	assert.Nil(t, err)
+
+	req := &http.Request{Header: http.Header{"Authorization": []string{"Bearer " + runtimeToken}}}
+	gotRunID, err := common.ValidateAuthorizationToken(rc.Config.ArtifactServerAuthKey, req)
+	assert.NoError(t, err)
+	assert.Equal(t, int64(1), gotRunID)
+	_, err = common.ValidateAuthorizationToken([]byte("another key"), req)
+	assert.Error(t, err)
 }
 
 func TestSetRuntimeVariablesWithRunID(t *testing.T) {
 	rc := &RunContext{
 		Config: &Config{
-			ArtifactServerAddr: "myhost",
-			ArtifactServerPort: "8000",
+			ArtifactServerAddr:    "myhost",
+			ArtifactServerPort:    "8000",
+			ArtifactServerAuthKey: []byte("artifact server auth key"),
 			Env: map[string]string{
 				"GITHUB_RUN_ID": "45",
 			},
@@ -725,4 +737,48 @@ func TestSetRuntimeVariablesWithRunID(t *testing.T) {
 	scp, ok := claims["scp"]
 	assert.True(t, ok, "scp claim exists")
 	assert.Equal(t, "Actions.Results:45:45", scp, "contains expected scp claim")
+
+	req := &http.Request{Header: http.Header{"Authorization": []string{"Bearer " + runtimeToken}}}
+	gotRunID, err := common.ValidateAuthorizationToken(rc.Config.ArtifactServerAuthKey, req)
+	assert.NoError(t, err)
+	assert.Equal(t, int64(45), gotRunID)
+}
+
+func TestIsHostEnvUsesSharedPlatformCheck(t *testing.T) {
+	cases := []struct {
+		name      string
+		image     string
+		container string
+		want      bool
+	}{
+		{name: "canonical", image: "-self-hosted", want: true},
+		{name: "upper", image: "-SELF-HOSTED", want: true},
+		{name: "mixed", image: "-Self-Hosted", want: true},
+		{name: "long s", image: "-\u017felf-hosted", want: true},
+		{name: "padded", image: " \t-SELF-HOSTED \n", want: true},
+		{name: "nbsp", image: "\u00a0-Self-Hosted\u00a0", want: true},
+		{name: "docker image", image: "node:16-buster-slim", want: false},
+		{name: "label without hyphen", image: "self-hosted", want: false},
+		{name: "suffix", image: "-self-hosted-extra", want: false},
+		{name: "fullwidth", image: "-\uff53elf-hosted", want: false},
+		{name: "container overrides host platform", image: "-SELF-HOSTED", container: "ubuntu:22.04", want: false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			jobYAML := "runs-on: ubuntu-latest"
+			if tc.container != "" {
+				jobYAML += "\ncontainer: \"" + tc.container + "\""
+			}
+			rc := createIfTestRunContext(map[string]*model.Job{
+				"job1": createJob(t, jobYAML, ""),
+			})
+			rc.Config.Platforms = map[string]string{"ubuntu-latest": tc.image}
+			assert.Equal(t, tc.want, rc.IsHostEnv(context.Background()))
+			if tc.container == "" {
+				assert.Equal(t, tc.want, common.IsHostPlatform(tc.image))
+			} else {
+				assert.True(t, common.IsHostPlatform(tc.image))
+			}
+		})
+	}
 }
